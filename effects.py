@@ -9,6 +9,7 @@ the GPU post-processing shader or is composited in the scene pass.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -186,17 +187,21 @@ class TrailManager:
 # Heatmap — attacked-square glow
 # ═════════════════════════════════════════════════════════════════════════
 
-# Heatmap cache (keyed by board zobrist hash)
-_heatmap_cache: Dict[int, np.ndarray] = {}
+# Heatmap cache with LRU eviction (max 200 entries)
+_heatmap_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+_HEATMAP_CACHE_MAX_SIZE = 200
 
 
 def compute_heatmap(board: chess.Board) -> np.ndarray:
     """Return an 8×8 float array where each cell = number of attackers (both sides).
-    Cached per position (zobrist hash)."""
+    Cached per position (zobrist hash) with LRU eviction to prevent memory leak."""
     key = chess.polyglot.zobrist_hash(board)
-    cached = _heatmap_cache.get(key)
-    if cached is not None:
-        return cached
+    
+    # Check cache with LRU update
+    if key in _heatmap_cache:
+        _heatmap_cache.move_to_end(key)
+        return _heatmap_cache[key]
+    
     hmap = np.zeros((8, 8), dtype=np.float32)
     for sq in range(64):
         col = sq % 8
@@ -204,12 +209,15 @@ def compute_heatmap(board: chess.Board) -> np.ndarray:
         w_att = len(board.attackers(chess.WHITE, sq))
         b_att = len(board.attackers(chess.BLACK, sq))
         hmap[row, col] = float(w_att + b_att)
+    
     mx = hmap.max()
     if mx > 0:
         hmap /= mx
-    # Keep cache small (max ~200 entries)
-    if len(_heatmap_cache) > 200:
-        _heatmap_cache.clear()
+    
+    # Evict oldest entries if cache is full (LRU policy)
+    while len(_heatmap_cache) >= _HEATMAP_CACHE_MAX_SIZE:
+        _heatmap_cache.popitem(last=False)
+    
     _heatmap_cache[key] = hmap
     return hmap
 
