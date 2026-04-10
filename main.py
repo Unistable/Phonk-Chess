@@ -14,6 +14,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -22,10 +23,17 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import chess
 import numpy as np
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    tqdm = None  # type: ignore
 
 from config import Config
 from chess_core import ChessCore
@@ -91,6 +99,19 @@ SUPPORTED_AUDIO_FORMATS = {'.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac'}
 SUPPORTED_VIDEO_FORMATS = {'.mp4', '.mkv', '.avi', '.webm'}
 
 
+def load_config_file(config_path: str) -> Dict[str, Any]:
+    """Load configuration from JSON file."""
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    
+    with open(config_file, 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+    
+    logger.info(f"Loaded configuration from: {config_path}")
+    return config_data
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Phonk Chess Edit Generator — turns PGN + audio into an aggressive MP4.",
@@ -106,11 +127,21 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", type=str, default=None,
                     help="Path to JSON configuration file (optional)")
     ap.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    ap.add_argument("--no-progress", action="store_true", help="Disable progress bar (for CI/CD)")
     return ap.parse_args()
 
 
-def validate_inputs(args: argparse.Namespace) -> None:
+def validate_inputs(args: argparse.Namespace, config_data: Optional[Dict[str, Any]] = None) -> None:
     """Validate all input files and parameters before processing."""
+    # Allow config file to override some arguments
+    if config_data:
+        if 'fps' in config_data and args.fps == 30:  # Only if default
+            args.fps = int(config_data.get('fps', args.fps))
+        if 'width' in config_data and args.width == 1920:
+            args.width = int(config_data.get('width', args.width))
+        if 'height' in config_data and args.height == 1080:
+            args.height = int(config_data.get('height', args.height))
+    
     # Validate PGN file
     pgn_path = Path(args.pgn)
     if not pgn_path.exists():
@@ -284,9 +315,15 @@ class FFmpegPipe:
 
 def run(args: argparse.Namespace) -> None:
     """Main render loop orchestrator."""
+    config_data = None
+    
     try:
-        # Validate inputs before starting
-        validate_inputs(args)
+        # Load config file if provided
+        if args.config:
+            config_data = load_config_file(args.config)
+        
+        # Validate inputs before starting (with config overrides)
+        validate_inputs(args, config_data)
         
         cfg = Config(width=args.width, height=args.height, fps=args.fps)
 
@@ -325,8 +362,17 @@ def run(args: argparse.Namespace) -> None:
         last_triggered_idx = -1
         trail_interval_counter = 0
 
-        # Progress tracking
-        last_progress_frame = 0
+        # Progress tracking with tqdm if available
+        use_tqdm = TQDM_AVAILABLE and not args.quiet and not args.no_progress
+        progress_bar = None
+        if use_tqdm:
+            progress_bar = tqdm(
+                total=total_frames,
+                desc="Rendering",
+                unit="frame",
+                leave=True,
+                dynamic_ncols=True,
+            )
         progress_interval = max(1, cfg.fps)  # Update progress every second
 
         for fi in range(total_frames):
@@ -408,91 +454,98 @@ def run(args: argparse.Namespace) -> None:
                 # Checkmate invert
                 if move_data.is_checkmate:
                     effects.trigger_checkmate_invert()
-        else:
-            effects.trails.clear()
-            trail_interval_counter = 0
 
-        # ── Update sub-systems ───────────────────────────────────────────
-        active_sq = move_data.to_square if move_data else None
-        next_sq = None
-        if nxt is not None and nxt.move_index < len(chess_core.moves):
-            next_sq = chess_core.moves[nxt.move_index].to_square
+            # ── Update sub-systems ───────────────────────────────────────────
+            active_sq = move_data.to_square if move_data else None
+            next_sq = None
+            if nxt is not None and nxt.move_index < len(chess_core.moves):
+                next_sq = chess_core.moves[nxt.move_index].to_square
 
-        cam = camera.update(dt, t, af,
-                            active_sq=active_sq,
-                            next_sq=next_sq,
-                            drama=drama)
+            cam = camera.update(dt, t, af,
+                                active_sq=active_sq,
+                                next_sq=next_sq,
+                                drama=drama)
 
-        effects.update(dt, af.bass_energy, af.high_energy, af.onset_strength)
+            effects.update(dt, af.bass_energy, af.high_energy, af.onset_strength)
 
-        # ── Heatmap ──────────────────────────────────────────────────────
-        hmap = compute_heatmap(board)
+            # ── Heatmap ──────────────────────────────────────────────────────
+            hmap = compute_heatmap(board)
 
-        # ── Check path (neon highlight from checker to king) ─────────────
-        check_path = _compute_check_path(board)
+            # ── Check path (neon highlight from checker to king) ─────────────
+            check_path = _compute_check_path(board)
 
-        # ── SAN overlay ──────────────────────────────────────────────────
-        san = None
-        if ev is not None and t >= ev.hit_time and t < ev.hit_time + 0.6:
-            san = chess_core.moves[ev.move_index].san
+            # ── SAN overlay ──────────────────────────────────────────────────
+            san = None
+            if ev is not None and t >= ev.hit_time and t < ev.hit_time + 0.6:
+                san = chess_core.moves[ev.move_index].san
 
-        # ── Render ───────────────────────────────────────────────────────
-        frame = renderer.render_frame(
-            board=board,
-            anim_piece=anim_piece,
-            effect_mgr=effects,
-            cam=cam,
-            audio_bass=af.bass_energy,
-            audio_mid=af.mid_energy,
-            audio_high=af.high_energy,
-            onset_strength=af.onset_strength,
-            time_sec=t,
-            san_text=san,
-            heatmap=hmap,
-            check_path=check_path,
-        )
-
-        pipe.write_frame(frame)
-
-        # ── Progress ─────────────────────────────────────────────────────
-        if not args.quiet and (fi % progress_interval == 0 or fi == total_frames - 1):
-            elapsed = time.time() - t0_wall
-            pct = (fi + 1) / total_frames * 100
-            fps_real = (fi + 1) / max(elapsed, 0.01)
-            eta = (total_frames - fi - 1) / max(fps_real, 0.01)
-            sys.stdout.write(
-                f"\r  [{pct:5.1f}%]  frame {fi + 1}/{total_frames}  "
-                f"@ {fps_real:.1f} fps   ETA {eta:.0f}s   "
+            # ── Render ───────────────────────────────────────────────────────
+            frame = renderer.render_frame(
+                board=board,
+                anim_piece=anim_piece,
+                effect_mgr=effects,
+                cam=cam,
+                audio_bass=af.bass_energy,
+                audio_mid=af.mid_energy,
+                audio_high=af.high_energy,
+                onset_strength=af.onset_strength,
+                time_sec=t,
+                san_text=san,
+                heatmap=hmap,
+                check_path=check_path,
             )
-            sys.stdout.flush()
+
+            pipe.write_frame(frame)
+
+            # ── Progress ─────────────────────────────────────────────────────
+            if progress_bar:
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    'fps': f"{(fi + 1) / max(time.time() - t0_wall, 0.01):.1f}",
+                    'frame': f"{fi + 1}/{total_frames}",
+                })
+            elif not args.quiet and (fi % progress_interval == 0 or fi == total_frames - 1):
+                elapsed = time.time() - t0_wall
+                pct = (fi + 1) / total_frames * 100
+                fps_real = (fi + 1) / max(elapsed, 0.01)
+                eta = (total_frames - fi - 1) / max(fps_real, 0.01)
+                sys.stdout.write(
+                    f"\r  [{pct:5.1f}%]  frame {fi + 1}/{total_frames}  "
+                    f"@ {fps_real:.1f} fps   ETA {eta:.0f}s   "
+                )
+                sys.stdout.flush()
+
+        # Close progress bar if used
+        if progress_bar:
+            progress_bar.close()
 
         # ── Finalise ─────────────────────────────────────────────────────────
-    logger.info("Encoding final MP4...")
-    rc = pipe.close()
-    renderer.destroy()
-    
-    if rc == 0:
-        sz = os.path.getsize(args.output) / (1024 * 1024)
-        logger.info(f"Success! Output: {args.output} ({sz:.1f} MB)")
-    else:
-        logger.error(f"FFmpeg exited with code {rc}")
-        raise RuntimeError(f"Video encoding failed with exit code {rc}")
+        logger.info("Encoding final MP4...")
+        rc = pipe.close()
+        renderer.destroy()
         
-except FileNotFoundError as e:
-    logger.error(f"File not found: {e}")
-    sys.exit(1)
-except PermissionError as e:
-    logger.error(f"Permission denied: {e}")
-    sys.exit(1)
-except ValueError as e:
-    logger.error(f"Invalid value: {e}")
-    sys.exit(1)
-except RuntimeError as e:
-    logger.error(f"Runtime error: {e}")
-    sys.exit(1)
-except Exception as e:
-    logger.exception(f"Unexpected error: {e}")
-    sys.exit(1)
+        if rc == 0:
+            sz = os.path.getsize(args.output) / (1024 * 1024)
+            logger.info(f"Success! Output: {args.output} ({sz:.1f} MB)")
+        else:
+            logger.error(f"FFmpeg exited with code {rc}")
+            raise RuntimeError(f"Video encoding failed with exit code {rc}")
+            
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        sys.exit(1)
+    except PermissionError as e:
+        logger.error(f"Permission denied: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        logger.error(f"Invalid value: {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        logger.error(f"Runtime error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        sys.exit(1)
 
 
 # ═════════════════════════════════════════════════════════════════════════
