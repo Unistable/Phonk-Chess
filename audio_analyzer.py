@@ -83,8 +83,86 @@ class AudioAnalyzer:
     def _load_and_analyze(self) -> None:
         print(f"[AudioAnalyzer] Loading {self.audio_path} …")
         hop = self.config.hop_length
-        self.y, self.sr = librosa.load(self.audio_path,
-                                       sr=self.config.sample_rate, mono=True)
+        
+        # Try multiple loading strategies for maximum compatibility
+        try:
+            # Strategy 1: Direct librosa load with audioread backend
+            import audioread
+            # Force audioread to use ffmpeg backend explicitly
+            try:
+                self.y, self.sr = librosa.load(
+                    self.audio_path,
+                    sr=self.config.sample_rate, 
+                    mono=True,
+                    backend='audioread'
+                )
+            except TypeError:
+                # Older librosa versions don't support backend parameter
+                self.y, self.sr = librosa.load(
+                    self.audio_path,
+                    sr=self.config.sample_rate, 
+                    mono=True
+                )
+        except Exception as e1:
+            print(f"[AudioAnalyzer] Primary load failed: {e1}")
+            print("[AudioAnalyzer] Trying FFmpeg direct decode...")
+            
+            # Strategy 2: Direct FFmpeg decode to WAV stream
+            try:
+                import subprocess
+                import io
+                import soundfile as sf
+                
+                # Use FFmpeg to decode to raw PCM
+                result = subprocess.run(
+                    [
+                        'ffmpeg', '-i', self.audio_path,
+                        '-f', 's16le', '-acodec', 'pcm_s16le',
+                        '-ac', '1', '-ar', str(self.config.sample_rate),
+                        '-'
+                    ],
+                    capture_output=True,
+                    check=True
+                )
+                
+                # Convert raw PCM to numpy array
+                raw_audio = np.frombuffer(result.stdout, dtype=np.int16)
+                self.y = raw_audio.astype(np.float32) / 32768.0
+                self.sr = self.config.sample_rate
+                
+            except Exception as e2:
+                print(f"[AudioAnalyzer] FFmpeg direct decode failed: {e2}")
+                print("[AudioAnalyzer] Trying fallback to scipy wav read...")
+                
+                # Strategy 3: Last resort - convert to temp WAV first
+                try:
+                    import tempfile
+                    import os
+                    import subprocess
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                        tmp_path = tmp.name
+                    
+                    # Convert to WAV using FFmpeg
+                    subprocess.run([
+                        'ffmpeg', '-i', self.audio_path,
+                        '-ar', str(self.config.sample_rate),
+                        '-ac', '1',
+                        '-y', tmp_path
+                    ], check=True, capture_output=True)
+                    
+                    # Load the WAV file
+                    self.y, self.sr = librosa.load(tmp_path, sr=self.config.sample_rate, mono=True)
+                    os.unlink(tmp_path)
+                    
+                except Exception as e3:
+                    print(f"[AudioAnalyzer] All loading strategies failed: {e3}")
+                    raise RuntimeError(
+                        f"Failed to load audio file '{self.audio_path}'. "
+                        "Ensure FFmpeg is installed and in PATH, or try converting to WAV format."
+                    ) from e3
+        
+        # Calculate duration after successful load
         self.duration = float(librosa.get_duration(y=self.y, sr=self.sr))
         print(f"[AudioAnalyzer] Duration: {self.duration:.1f}s  SR: {self.sr}")
 
