@@ -84,6 +84,27 @@ class AudioAnalyzer:
         print(f"[AudioAnalyzer] Loading {self.audio_path} …")
         hop = self.config.hop_length
         
+        # Validate file exists before attempting to load
+        if not os.path.exists(self.audio_path):
+            raise FileNotFoundError(f"Audio file '{self.audio_path}' does not exist")
+        
+        # Ensure FFmpeg is in PATH for subprocess calls
+        # Check multiple sources: hardcoded path, env variable, system PATH
+        ffmpeg_paths_to_try = [
+            os.environ.get('FFMPEG_PATH', ''),
+            r"C:\ffmpeg-2026-02-18-git-52b676bb29-full_build\bin",
+            r"C:\Program Files\ffmpeg\bin",
+        ]
+        
+        for ffmpeg_path in ffmpeg_paths_to_try:
+            if ffmpeg_path and os.path.exists(ffmpeg_path):
+                ffmpeg_exe = os.path.join(ffmpeg_path, 'ffmpeg.exe')
+                if os.path.isfile(ffmpeg_exe):
+                    if ffmpeg_path not in os.environ.get('PATH', ''):
+                        os.environ['PATH'] = ffmpeg_path + os.pathsep + os.environ.get('PATH', '')
+                        print(f"[AudioAnalyzer] Added FFmpeg to PATH: {ffmpeg_path}")
+                    break
+        
         # Try multiple loading strategies for maximum compatibility
         try:
             # Strategy 1: Direct librosa load with audioread backend
