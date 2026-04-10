@@ -8,6 +8,9 @@ and exposes a fast per-frame query ``get_features_at_time(t)``.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
